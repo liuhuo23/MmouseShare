@@ -273,14 +273,32 @@ func (s *Session) StartClient(addr string) error {
 	return nil
 }
 
-// Scan looks for the hubs of the local network.
+// Scan looks for the hubs of the local network. The scanner of the session
+// listens until the session stops, so asking again only keeps it going: a
+// scanner per press of the button would leave the port of the beacons bound
+// by a scanner nobody reads, and the next press would fail with "address
+// already in use".
 func (s *Session) Scan() error {
+	s.mu.Lock()
+	scanner := s.scanner
+	s.mu.Unlock()
+	if scanner != nil {
+		return nil
+	}
+
 	scanner, err := discovery.NewScanner()
 	if err != nil {
 		return err
 	}
 	scanner.OnFound(func(discovery.Device) { s.notify() })
+
 	s.mu.Lock()
+	if s.scanner != nil {
+		// Another goroutine was faster; its scanner is the one to keep.
+		s.mu.Unlock()
+		_ = scanner.Close()
+		return nil
+	}
 	s.scanner = scanner
 	s.mu.Unlock()
 	return nil

@@ -61,7 +61,12 @@ type Announcer struct {
 // NewAnnouncer returns an announcer that says that a hub is there. The
 // beacon is sent on the given port.
 func NewAnnouncer(name string, port, width, height int) (*Announcer, error) {
-	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", DefaultPort))
+	// The announcer only writes: it takes a port of its own, the one the
+	// system picks, so that it leaves the port of the beacons to the
+	// scanners. A hub that looks for the other hubs of the room is the
+	// usual case, and it used to fail with "address already in use"
+	// because it held that port itself.
+	conn, err := net.ListenPacket("udp4", ":0")
 	if err != nil {
 		return nil, fmt.Errorf("discovery: listen: %w", err)
 	}
@@ -136,7 +141,7 @@ type Scanner struct {
 
 // NewScanner returns a scanner that listens for the beacons of the hubs.
 func NewScanner() (*Scanner, error) {
-	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", DefaultPort))
+	conn, err := listenBeacons()
 	if err != nil {
 		return nil, fmt.Errorf("discovery: listen: %w", err)
 	}

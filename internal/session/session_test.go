@@ -44,3 +44,17 @@ func TestSetEdgeNotifies(t *testing.T) {
 		t.Fatal("the listener did not hear about the new edge")
 	}
 }
+
+// TestScanTwiceKeepsOneScanner guards the port of the beacons: the scanner
+// listens until the session stops, so the second press of the button must not
+// open a second one and lose the port of the first.
+func TestScanTwiceKeepsOneScanner(t *testing.T) {
+	s := New("test", "id", ModeClient)
+	if err := s.Scan(); err != nil {
+		t.Fatalf("the first scan: %v", err)
+	}
+	if err := s.Scan(); err != nil {
+		t.Fatalf("the second scan: %v", err)
+	}
+	s.Stop()
+}
