@@ -17,11 +17,18 @@ const (
 	DefaultPort = 27301
 	// dialTimeout is how long the client waits for the hub.
 	dialTimeout = 5 * time.Second
+	// writeTimeout is how long a message waits for the hub before the
+	// connection is taken as gone.
+	writeTimeout = 2 * time.Second
 )
 
 // Client is a device connected to a hub.
 type Client struct {
 	mu sync.Mutex
+	// writeMu keeps the messages whole: the window of the program, the mouse
+	// of the computer and the keep alive all write to the connection, and a
+	// message has to go out in one piece.
+	writeMu sync.Mutex
 
 	// name is the name of this device.
 	name string
@@ -80,7 +87,7 @@ func (c *Client) Connect(addr string) error {
 	c.rw = bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	c.done = make(chan struct{})
 
-	if err := protocol.Write(c.rw, protocol.Message{
+	if err := c.write(c.rw, conn, protocol.Message{
 		Type:    protocol.TypeHello,
 		Version: protocol.Version,
 		Name:    c.name,
@@ -116,11 +123,29 @@ func (c *Client) Send(m protocol.Message) error {
 	c.mu.Lock()
 	closed := c.closed
 	rw := c.rw
+	conn := c.conn
 	c.mu.Unlock()
 	if closed || rw == nil {
 		return fmt.Errorf("client: not connected")
 	}
-	return protocol.Write(rw, m)
+	return c.write(rw, conn, m)
+}
+
+// write sends one message on the connection, alone, and closes the connection
+// when it cannot: the hub is gone or is not reading, and the reader of the
+// client then tells the window instead of every movement of the mouse waiting
+// for it.
+func (c *Client) write(rw *bufio.ReadWriter, conn net.Conn, m protocol.Message) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if conn != nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	}
+	err := protocol.Write(rw, m)
+	if err != nil && conn != nil {
+		_ = conn.Close()
+	}
+	return err
 }
 
 // Move sends a movement of the mouse, and where the cursor of this device

@@ -3,6 +3,7 @@ package hub
 import (
 	"bufio"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -260,6 +261,7 @@ func TestThePointerStaysOnTheVirtualDesktop(t *testing.T) {
 		t.Errorf("the pointer is on %s, want host", h.Active())
 	}
 }
+
 // TestTheButtonOfTheClientKeepsThePlaceOfThePointer makes sure that a
 // click of a client does not move the pointer, because a click says
 // nothing about the place of the cursor.
@@ -333,3 +335,79 @@ func TestTheLayoutPutsTheClientOnTheEdgeItAskedFor(t *testing.T) {
 }
 
 var _ = virtual.Point{}
+
+// TestPeerWritesOneMessageAtATime writes to one client from many goroutines at
+// once, as the mouse of the host, the reader of the client and the walk of the
+// pointer do, and reads the messages the client would get.
+func TestPeerWritesOneMessageAtATime(t *testing.T) {
+	here, there := net.Pipe()
+	defer func() { _ = there.Close() }()
+	p := &peer{
+		conn: here,
+		rw:   bufio.NewReadWriter(bufio.NewReader(here), bufio.NewWriter(here)),
+	}
+
+	const writers, each = 8, 50
+	read := make(chan int, 1)
+	go func() {
+		r := bufio.NewReader(there)
+		n := 0
+		for {
+			if _, err := protocol.Read(r); err != nil {
+				read <- n
+				return
+			}
+			n++
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < each; j++ {
+				if err := p.write(protocol.Message{
+					Type:   protocol.TypePointer,
+					Device: "host",
+					Active: "host",
+					X:      100,
+					Y:      200,
+				}); err != nil {
+					t.Errorf("a message did not go out: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	_ = there.Close()
+	select {
+	case n := <-read:
+		if want := writers * each; n != want {
+			t.Errorf("the client read %d messages, want %d: the messages are mixed up", n, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client read nothing")
+	}
+}
+
+// TestPeerWriteClosesAClientThatIsGone tells that a message that cannot go out
+// closes the connection, so that the hub forgets the client instead of waiting
+// for it at every movement of the mouse.
+func TestPeerWriteClosesAClientThatIsGone(t *testing.T) {
+	here, there := net.Pipe()
+	_ = there.Close()
+	p := &peer{
+		conn: here,
+		rw:   bufio.NewReadWriter(bufio.NewReader(here), bufio.NewWriter(here)),
+	}
+
+	if err := p.write(protocol.Message{Type: protocol.TypePointer}); err == nil {
+		t.Fatal("the message to a client that is gone did not fail")
+	}
+	if _, err := here.Write([]byte("x")); err == nil {
+		t.Fatal("the connection of the client that is gone is still open")
+	}
+}

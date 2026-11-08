@@ -36,6 +36,10 @@ import (
 const (
 	// DefaultPort is the port the hub listens on.
 	DefaultPort = 27301
+	// writeTimeout is how long a message waits for a client before the
+	// client is taken as gone. Without it a client that stopped reading
+	// holds the writer, and with it the mouse of the host, for good.
+	writeTimeout = 2 * time.Second
 )
 
 // Hub is the server of the sharing.
@@ -90,7 +94,10 @@ type peer struct {
 
 	conn net.Conn
 	rw   *bufio.ReadWriter
-	mu   sync.Mutex
+	// mu keeps the messages whole: the mouse of the host, the reader of
+	// this client and the walk of the pointer all write to it, and a
+	// message has to go out in one piece.
+	mu sync.Mutex
 
 	// x and y are the place of the cursor of the peer, on its own
 	// screen.
@@ -233,7 +240,7 @@ func (h *Hub) serve(conn net.Conn) {
 
 	// The client is told that it is welcome before it hears about the
 	// devices, so that it knows the hub took it.
-	if err := protocol.Write(rw, protocol.Message{
+	if err := p.write(protocol.Message{
 		Type:    protocol.TypeWelcome,
 		Version: protocol.Version,
 		Port:    h.port,
@@ -688,9 +695,18 @@ func (h *Hub) Close() error {
 	return nil
 }
 
-// write sends a message to the client.
+// write sends a message to the client, alone, and closes the connection when
+// it cannot: the reader of the client then goes, and the hub forgets it
+// instead of waiting for it at every movement of the mouse.
 func (p *peer) write(m protocol.Message) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return protocol.Write(p.rw, m)
+	if p.conn != nil {
+		_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	}
+	err := protocol.Write(p.rw, m)
+	if err != nil && p.conn != nil {
+		_ = p.conn.Close()
+	}
+	return err
 }
