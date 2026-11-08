@@ -1,0 +1,162 @@
+# MmouseShare
+
+把一只鼠标共享到局域网的多台电脑。指针走到屏幕边缘就会切到相邻的设备，
+点击、滚轮跟着一起过去。
+
+用 [MyGo](https://mygo.egoist.dev/) 写成：界面是 Go 代码，由 MyGo 自己画，
+不需要 WebView，也不需要 Bun。
+
+```
+┌──────────┐        ┌──────────┐        ┌──────────┐
+│   电脑 A  │◀──────▶│   电脑 B  │◀──────▶│   电脑 C  │
+│   主机    │   TCP  │   客户端  │   TCP  │   客户端  │
+└──────────┘        └──────────┘        └──────────┘
+     ↑                                       ↑
+     └─────────── 指针走到边缘即切换 ─────────┘
+```
+
+## 特点
+
+- **指针跨屏**：所有设备的屏幕在逻辑上拼成一张"虚拟桌面"，指针走出当前屏幕
+  就会出现在相邻屏幕上，不会跳变。
+- **谁在动谁接管**：移动 A 的鼠标时，指针在所有屏幕上同步移动；此时去动 B 的
+  鼠标，B 会立刻接管指针。这和真实的双机手感一致。
+- **按键跟随**：点击和滚轮只会作用在指针当前所在的那块屏幕上。
+- **自动发现**：主机每秒广播一次自己的地址，同网段的客户端点一下就能连上，
+  不用手填 IP。
+- **三平台**：Windows / macOS / Linux 全部实现，纯 Go，无 cgo。
+
+## 快速开始
+
+### 1. 准备环境
+
+需要 Go 1.27 或更高版本（MyGo 的要求）：
+
+```bash
+go version   # 需要 >= 1.27.3
+```
+
+### 2. 构建与运行
+
+```bash
+git clone <this repo>
+cd MmouseShare
+
+# 开发模式（自动重载）
+go tool mygo dev
+
+# 打包（产物在 build/ 下）
+go tool mygo build
+```
+
+### 3. 使用
+
+1. 在一台电脑上选择「主机（共享鼠标）」，点「启动共享」。
+2. 在其他电脑上选择「客户端（跟随主机）」，点「扫描局域网设备」，
+   在列表里点「连接」；或者直接手动填写主机地址 `192.168.x.x:27301`。
+3. 在客户端里选择这台设备在虚拟桌面上的位置（右边 / 左边 / 上边 / 下边）。
+4. 好了。在主机的屏幕上把指针往右推，它会走到右边那台电脑上。
+
+> 主机与客户端需要在同一局域网，且端口未被防火墙拦截。默认端口：
+> TCP `27301`（控制通道）、UDP `27302`（设备发现广播）。
+
+## 架构
+
+```
+main.go                 MyGo 原生界面 + 系统托盘
+internal/protocol       线上协议：一行一个 JSON 消息
+internal/virtual        虚拟桌面几何：各屏幕的位置、指针位置换算
+internal/hub            主机：维护虚拟桌面、路由事件、切屏
+internal/client         客户端：连接主机、收发事件
+internal/discovery      UDP 广播，主机自报家门
+internal/input          平台相关：捕获真实鼠标 + 注入鼠标事件
+internal/session        把上面这些组装起来
+```
+
+### 事件流
+
+```
+本机鼠标 ──► input.Capture ──► session ──► hub ──┬──► client ──► input 注入
+                                                      │
+                                          虚拟桌面指针位置广播
+```
+
+主机维护唯一的「虚拟指针」，坐标是虚拟桌面坐标系（各屏幕矩形拼起来的
+平面）。客户端收到指针位置后，减去自己屏幕在虚拟桌面中的偏移，得到自己
+屏幕内的坐标并注入。
+
+### 协议
+
+每条消息是一行 JSON，便于用 `nc` 之类的工具直接观察：
+
+| 消息 | 方向 | 作用 |
+|------|------|------|
+| `hello` | 客户端 → 主机 | 自我介绍：名字、屏幕尺寸、所在边缘 |
+| `welcome` | 主机 → 客户端 | 握手成功 |
+| `register` | 客户端 → 主机 | 换边缘 / 改屏幕尺寸 |
+| `devices` | 主机 → 客户端 | 设备清单与布局 |
+| `event` | 双向 | 鼠标移动 / 按键 / 滚轮 |
+| `pointer` | 主机 → 客户端 | 虚拟指针位置 + 当前所在屏幕 + 谁持有鼠标 |
+| `warp` | 主机 → 客户端 | 让客户端把光标挪到屏幕另一端，指针才能继续走出去 |
+| `grab` | 客户端 → 主机 | 请求接管指针 |
+| `ping` / `pong` | 双向 | 保活 |
+
+## 各平台实现
+
+| 平台 | 捕获真实鼠标 | 注入鼠标事件 |
+|------|-------------|-------------|
+| Windows | `SetWindowsHookEx(WH_MOUSE_LL)` 低级钩子 | `SendInput` |
+| macOS | `CGEventTapCreate` 事件 tap | `CGEventPost` |
+| Linux | evdev（直读 `/dev/input/event*`） | X11 `XTestFakeMotionEvent` |
+
+三个后端都只用 `purego` 直接调用系统库，没有 cgo，因此可以交叉编译。
+
+### 各平台需要注意的地方
+
+**Windows** — 注入的事件会被钩子再次捕获，形成回环。后端通过检查
+`MSLLHOOKSTRUCT.flags` 里的 `LLMHF_INJECTED` 标记忽略自己注入的事件。
+
+**macOS** — 需要给程序开启「辅助功能」权限，否则事件 tap 收不到事件，
+后端在启动时就会用 `CGPreflightPostEventAccess` 检查并给出提示。
+注入时会给事件打上 `kCGEventSourceUserData` 魔数（`0x4D4D5348`），捕获时据此
+忽略回环。事件 tap 是只读的（`kCGEventTapOptionListenOnly`），不会拦下系统事件；
+tap 跑在一个锁定线程自己的 `CFRunLoop` 上。
+
+macOS 的滚轮方向和 Linux/Windows 相反：窗口服务器把「向上滚」记成负值，
+后端按事件字段 `kCGEventDirectionInvertedFromDevice`(137) 判断系统是否已经
+替用户反转过方向，据此统一成正数＝向上。
+
+**Linux** — 需要 X11 或 XWayland（纯 Wayland 不支持，注入走 XTest）。
+读取 `/dev/input/event*` 通常需要 root 或 `input` 组权限，建议配 udev 规则：
+
+```
+# /etc/udev/rules.d/99-mmouse-share.rules
+KERNEL=="event[0-9]*", SUBSYSTEM=="input", MODE="0660", GROUP="input"
+```
+
+### 指针的起始位置
+
+三个后端在开始共享时都会先问系统「指针现在在哪」（Windows `GetCursorPos`、
+macOS `CGEventGetLocation`、Linux `XQueryPointer`），再从这个位置开始跟踪移动。
+否则鼠标明明在屏幕中间，虚拟指针却会从左上角开始走。
+
+## 测试
+
+```bash
+go test ./...
+```
+
+覆盖了协议编解码、虚拟桌面几何（边缘布局、指针换算、越界钳制），
+以及主机与客户端之间的端到端行为（跨屏、点击路由、控制权接管）。
+
+## 已知限制
+
+- 只共享鼠标，不共享键盘和剪贴板。
+- 虚拟桌面是单向布局的：客户端只能挂在主机的四条边上，没有任意窗口排列。
+- Linux 未做 Xinerama 多屏支持，只认默认屏幕。
+- macOS 的事件 tap 需要辅助功能权限。
+- macOS 与 Linux 的后端只做了交叉编译验证，没有在真实设备上跑过：事件 tap
+  的权限弹窗、辅助功能授权、XWayland 的输入注入都需要真机确认。
+- `go vet ./...` 会在 Windows 的钩子回调里报一处 `possible misuse of
+  unsafe.Pointer`：钩子参数 `lParam` 由系统给出，必须转成指针才能读结构体，
+  这是手写 Win32 钩子的固有写法，不影响正确性。
