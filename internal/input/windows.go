@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -28,7 +29,15 @@ var (
 	procGetCursorPos        = user32.NewProc("GetCursorPos")
 	procGetCurrentThreadId  = kernel32.NewProc("GetCurrentThreadId")
 	procGetModuleHandle     = kernel32.NewProc("GetModuleHandleW")
+	procSetCursor           = user32.NewProc("SetCursor")
+	procLoadCursor          = user32.NewProc("LoadCursorW")
+	procGetCursorInfo       = user32.NewProc("GetCursorInfo")
+	procGetCursor           = user32.NewProc("GetCursor")
 )
+
+// idcArrow is the arrow of the system, which is the cursor that is put back
+// on the screen when the cursor of the program is shown again.
+const idcArrow = 32512
 
 // The Windows messages the mouse hook reports.
 const (
@@ -132,6 +141,18 @@ type WinBackend struct {
 	started bool
 	done    chan struct{}
 	closed  chan struct{}
+
+	// cursorHidden tells that the cursor of the computer has to stay
+	// hidden, because the pointer of the sharing is on another screen.
+	cursorHidden bool
+	// cursorWatched tells that the goroutine that hides the cursor again
+	// and again runs.
+	cursorWatched bool
+	// arrow is the arrow of the system, which is put back on the screen
+	// when the cursor is shown again.
+	arrow uintptr
+	// stopped tells that the backend does not work any more.
+	stopped bool
 }
 
 func init() {
@@ -234,6 +255,11 @@ func (b *WinBackend) Stop() error {
 		return nil
 	}
 	b.started = false
+	b.stopped = true
+	// The cursor of the computer is given back, so that it is not left
+	// hidden when the sharing stops.
+	b.cursorHidden = false
+	b.showCursorLocked()
 	thread := b.thread
 	b.mu.Unlock()
 
@@ -241,6 +267,71 @@ func (b *WinBackend) Stop() error {
 		procPostThreadMessage.Call(uintptr(thread), wmQuit, 0, 0)
 	}
 	return nil
+}
+
+// ShowCursor shows the cursor of the computer or hides it.
+//
+// Only the screen that holds the pointer of the sharing shows a cursor, so
+// the cursor of the other screens is hidden while the pointer is elsewhere.
+//
+// Windows draws the cursor again as soon as the mouse moves, so the cursor
+// is hidden again and again while it has to stay hidden.
+func (b *WinBackend) ShowCursor(show bool) error {
+	b.mu.Lock()
+	b.cursorHidden = !show
+	watch := !b.cursorWatched
+	if watch {
+		b.cursorWatched = true
+	}
+	if show {
+		b.showCursorLocked()
+	} else {
+		b.hideCursorLocked()
+	}
+	b.mu.Unlock()
+
+	if watch {
+		go b.watchCursor()
+	}
+	return nil
+}
+
+// hideCursorLocked takes the cursor of the screen away. The lock of the
+// backend must be held.
+func (b *WinBackend) hideCursorLocked() {
+	procSetCursor.Call(0)
+}
+
+// showCursorLocked puts the arrow of the system back on the screen. The
+// lock of the backend must be held.
+func (b *WinBackend) showCursorLocked() {
+	if b.arrow == 0 {
+		cur, _, _ := procLoadCursor.Call(0, idcArrow)
+		if cur == 0 {
+			return
+		}
+		b.arrow = cur
+	}
+	procSetCursor.Call(b.arrow)
+}
+
+// watchCursor hides the cursor again and again, because Windows shows it
+// again every time the mouse moves.
+func (b *WinBackend) watchCursor() {
+	ticker := time.NewTicker(16 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		b.mu.Lock()
+		hidden := b.cursorHidden
+		stopped := b.stopped
+		if hidden {
+			b.hideCursorLocked()
+		}
+		b.mu.Unlock()
+		if stopped {
+			return
+		}
+	}
 }
 
 // hookProc is the callback Windows calls for every mouse event.
@@ -311,6 +402,13 @@ func (b *WinBackend) Move(dx, dy int) error {
 	if dx == 0 && dy == 0 {
 		return nil
 	}
+	// The place of the pointer is remembered, so that the movement that
+	// follows the move is the movement of the mouse and not the walk from
+	// the place the pointer was moved to.
+	b.mu.Lock()
+	b.lastX += dx
+	b.lastY += dy
+	b.mu.Unlock()
 	return b.sendInput(int32(dx), int32(dy), 0, mouseEventFMove)
 }
 
@@ -338,6 +436,13 @@ func (b *WinBackend) MoveTo(x, y int) error {
 	if ny > 65535 {
 		ny = 65535
 	}
+	// The place of the pointer is remembered, so that the movement that
+	// follows the move is the movement of the mouse and not the walk from
+	// the place the pointer was moved to. The hook gives the place on the
+	// whole desktop, so the origin of the screen is added to it.
+	b.mu.Lock()
+	b.lastX, b.lastY = x+int(left), y+int(top)
+	b.mu.Unlock()
 	return b.sendInput(int32(nx), int32(ny), 0, mouseEventFAbsolute|mouseEventFMove)
 }
 

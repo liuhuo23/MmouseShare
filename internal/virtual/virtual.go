@@ -206,6 +206,48 @@ func (l *Layout) At(p Point) (Device, Point, bool) {
 	return Device{}, p, false
 }
 
+// Clamp returns the point of the layout that is the closest to p, so that a
+// pointer that walked off the virtual desktop sticks to the edge of a screen
+// instead of disappearing.
+//
+// The point is in the place of the virtual desktop.
+func (l *Layout) Clamp(p Point) Point {
+	best := p
+	bestDist := 0
+	found := false
+	for _, d := range l.Devices() {
+		q := d.Rect.Clamp(p)
+		dist := (q.X - p.X) * (q.X - p.X) + (q.Y - p.Y) * (q.Y - p.Y)
+		if !found || dist < bestDist {
+			best, bestDist, found = q, dist, true
+		}
+	}
+	return best
+}
+
+// Bounds returns the rectangle that holds every screen of the layout.
+//
+// It is the whole of the virtual desktop: a pointer that walks past it has
+// nowhere left to go.
+func (l *Layout) Bounds() Rect {
+	b := l.Host.Rect
+	for _, d := range l.Peers {
+		if d.Rect.X < b.X {
+			b.X = d.Rect.X
+		}
+		if d.Rect.Y < b.Y {
+			b.Y = d.Rect.Y
+		}
+		if d.Rect.X+d.Rect.Width > b.X+b.Width {
+			b.Width = d.Rect.X + d.Rect.Width - b.X
+		}
+		if d.Rect.Y+d.Rect.Height > b.Y+b.Height {
+			b.Height = d.Rect.Y + d.Rect.Height - b.Y
+		}
+	}
+	return b
+}
+
 // Neighbor returns the device that shares an edge with the given one, on
 // the side the pointer left the screen on.
 //

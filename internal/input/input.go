@@ -101,6 +101,13 @@ type Backend interface {
 
 	// Primary returns the screen with the pointer on it.
 	Primary() Screen
+
+	// ShowCursor shows the cursor of the computer or hides it.
+	//
+	// Only the screen that holds the shared pointer shows a cursor, so
+	// the cursor of the other screens is hidden while the pointer is
+	// somewhere else.
+	ShowCursor(show bool) error
 }
 
 // Factory builds the backend of a platform. It is set by the file of the

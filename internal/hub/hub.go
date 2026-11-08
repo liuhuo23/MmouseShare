@@ -7,17 +7,21 @@
 // so that a pointer that walks off the right edge of one screen shows up
 // on the screen next to it.
 //
+// The pointer follows the mouse of the device that holds it, pixel by
+// pixel. The cursor of the operating system cannot leave the screen it is
+// on, so when it reaches the edge of that screen it is warped to the other
+// edge of it, and the pointer goes on. The warp is made by the system and
+// not by the user, so the pointer does not move because of it: it goes on
+// exactly where the mouse went.
+//
 // The device whose mouse the user is moving is the one that holds the
 // pointer. When the user moves the mouse of another device, that device
-// takes the pointer over, so the mouse of whichever computer is under the
-// hand drives the other ones.
+// takes the pointer over, and the pointer lands on the place of the cursor
+// of that device.
 //
-// The mouse of the operating system cannot leave the screen it is on, so
-// when the pointer walks to the edge of the screen of the device that
-// holds it, the cursor of that device is warped to the other edge of the
-// screen, and the pointer goes on. The pointer never jumps, because the
-// place of the screen in the virtual desktop moves by the same amount as
-// the cursor.
+// Only the screen that holds the pointer shows a cursor. The other screens
+// hide theirs, so that the pointer does not look like it moves on two
+// screens at once.
 package hub
 
 import (
@@ -65,20 +69,42 @@ type Hub struct {
 
 	// controller is the device whose mouse holds the pointer.
 	controller string
-	// cursorX and cursorY are the place of the cursor of the host, on
+	// anchor is the place of the pointer in the virtual desktop when the
+	// controller took it over. The pointer is the anchor plus the
+	// movement of the mouse since then.
+	anchor virtual.Point
+	// accum is the movement of the mouse of the controller since it took
+	// the pointer over.
+	accum virtual.Point
+	// anchorValid tells that the anchor is the place of a cursor that is
+	// known. The first movement of the mouse puts the anchor in its
+	// place.
+	anchorValid bool
+	// ctrlX and ctrlY are the place of the cursor of the controller, on
 	// its own screen.
-	cursorX int
-	cursorY int
-	// localWarp moves the cursor of the mouse of the host.
+	ctrlX int
+	ctrlY int
+	// hostX and hostY are the place of the cursor of the host, on its own
+	// screen.
+	hostX int
+	hostY int
+
+	// localWarp moves the cursor of the mouse of this device.
 	localWarp func(x, y int)
-	// originX and originY are the place of the screen of the
-	// controller in the virtual desktop.
-	originX int
-	originY int
+	// localActive is called when the pointer walks to another screen.
+	localActive func(active string, x, y int, visible bool)
+
 	// pointer is where the pointer is, in the virtual desktop.
 	pointer virtual.Point
 	// active is the screen the pointer is on.
 	active string
+
+	// told is what the device was told last, so that it is told again
+	// only when something changes.
+	toldActive  string
+	toldVisible bool
+	toldLocal   virtual.Point
+	told        bool
 
 	listener net.Listener
 	closed   bool
@@ -120,10 +146,24 @@ func New(name, id string, port int) (*Hub, error) {
 }
 
 // SetLocalWarp tells the hub how to move the cursor of the mouse of this
-// device, which it does when the pointer walks off the edge of the screen.
+// device, which it does when the cursor reaches the edge of the screen.
 func (h *Hub) SetLocalWarp(fn func(x, y int)) {
 	h.mu.Lock()
 	h.localWarp = fn
+	h.mu.Unlock()
+}
+
+// SetLocalActive tells the hub to tell this device when the pointer walks
+// to another screen.
+//
+// The cursor of a screen that does not hold the pointer is of no use, and
+// it would make the pointer look like it moves on two screens at once, so
+// the device hides it and shows it again when the pointer comes back. The
+// place is where the pointer is on the screen of this device, and visible
+// tells whether the cursor of this device is of any use at all.
+func (h *Hub) SetLocalActive(fn func(active string, x, y int, visible bool)) {
+	h.mu.Lock()
+	h.localActive = fn
 	h.mu.Unlock()
 }
 
@@ -142,6 +182,9 @@ func (h *Hub) SetHostScreen(width, height int) {
 	}
 	if h.controller == "" {
 		h.controller = h.id
+	}
+	if h.active == "" {
+		h.active = h.id
 	}
 	h.rebuildLocked()
 }
@@ -278,9 +321,10 @@ func (h *Hub) remove(id string) {
 	}
 	if h.controller == id {
 		// The device that held the pointer is gone, so the pointer
-		// comes back to the host.
+		// comes back to the host, at the place of the cursor of the
+		// host.
 		h.controller = h.id
-		h.originX, h.originY = h.host.Rect.X, h.host.Rect.Y
+		h.takeOverLocked(h.id, h.hostX, h.hostY)
 	}
 	h.rebuildLocked()
 	h.mu.Unlock()
@@ -329,92 +373,122 @@ func (h *Hub) handleEvent(from *peer, msg protocol.Message) {
 		from.x = msg.X
 		from.y = msg.Y
 	}
-	// The mouse of a device that does not hold the pointer takes the
-	// pointer over, the same way the mouse of the host does.
-	if h.controller != from.id {
-		h.controller = from.id
-		h.setOriginLocked(from.id)
-	}
-	// A movement says where the cursor of the peer is. A button or a
-	// wheel says nothing about the place, so the place that is known is
-	// used instead.
 	localX, localY := from.x, from.y
-	if msg.Kind == protocol.EventMove {
-		localX, localY = msg.X, msg.Y
+	dx, dy := msg.DX, msg.DY
+	if msg.Kind != protocol.EventMove {
+		// A button or a wheel does not move the pointer.
+		dx, dy = 0, 0
 	}
 	h.mu.Unlock()
 
-	h.pointerMoved(from.id, localX, localY, msg.Kind, msg.Button, msg.Down, msg.Wheel)
+	h.pointerMoved(from.id, localX, localY, dx, dy, msg.Kind, msg.Button, msg.Down, msg.Wheel)
 }
 
 // grab gives the pointer to a device that asks for it.
 func (h *Hub) grab(p *peer) {
 	h.mu.Lock()
-	h.controller = p.id
-	h.setOriginLocked(p.id)
+	localX, localY := p.x, p.y
 	h.mu.Unlock()
 
-	h.pointerMoved(p.id, p.x, p.y, protocol.EventMove, 0, false, 0)
+	h.pointerMoved(p.id, localX, localY, 0, 0, protocol.EventMove, 0, false, 0)
 }
 
 // pointerMoved moves the pointer of the virtual desktop, and hands the
 // screen over to the neighbour when the pointer walks off the edge.
 //
-// The cursor of the operating system cannot leave the screen it is on, so
-// when the pointer reaches the edge of the screen of the device that holds
-// it, the cursor of that device is warped to the other edge of the screen.
-// The place of the screen in the virtual desktop moves by the same amount,
-// so the pointer goes on where it was.
-func (h *Hub) pointerMoved(id string, localX, localY int, kind protocol.EventKind, btn protocol.Button, down bool, wheel int) {
+// The pointer follows the mouse of the device that holds it, pixel by
+// pixel. The cursor of the system cannot leave the screen it is on, so
+// when it reaches the edge of that screen it is warped to the other edge,
+// and the pointer goes on. The warp is made by the system and not by the
+// user, so the pointer does not move because of it.
+func (h *Hub) pointerMoved(id string, localX, localY, dx, dy int, kind protocol.EventKind, btn protocol.Button, down bool, wheel int) {
 	h.mu.Lock()
 
-	// The place of the screen of the device that holds the pointer. It
-	// only changes when the pointer moves to another device, or when the
-	// cursor is warped to the other edge of the screen.
-	if h.controller != id {
-		h.setOriginLocked(id)
+	// The device whose mouse holds the pointer. The mouse of another
+	// device takes the pointer over, and the pointer lands on the place
+	// of the cursor of that device.
+	takeover := h.controller != id || !h.anchorValid
+	if takeover {
+		h.takeOverLocked(id, localX, localY)
+	} else {
+		h.accum.X += dx
+		h.accum.Y += dy
 	}
-	// The pointer is the cursor of the device, in the place of its
-	// screen on the virtual desktop.
-	h.pointer = virtual.Point{X: h.originX + localX, Y: h.originY + localY}
+	h.ctrlX, h.ctrlY = localX, localY
+	if id == h.id {
+		h.hostX, h.hostY = localX, localY
+	} else if p, ok := h.peers[id]; ok {
+		p.x, p.y = localX, localY
+	}
+
+	// The pointer is the place of the cursor of the controller, on the
+	// virtual desktop.
+	h.pointer = virtual.Point{X: h.anchor.X + h.accum.X, Y: h.anchor.Y + h.accum.Y}
+
+	// A pointer that left the virtual desktop sticks to its edge, and the
+	// movement that follows goes back the way it came.
+	if clamped := h.layout.Clamp(h.pointer); clamped != h.pointer {
+		h.pointer = clamped
+		h.accum = virtual.Point{X: clamped.X - h.anchor.X, Y: clamped.Y - h.anchor.Y}
+	}
 
 	// The screen the pointer is on.
 	active, _, ok := h.layout.At(h.pointer)
 	if !ok {
-		// The pointer walked off the virtual desktop, so it comes back
-		// to the screen of the device that holds it.
-		if d, found := h.layout.Device(id); found {
-			local := d.Rect.Local(virtual.Point{X: localX, Y: localY})
-			h.pointer = virtual.Point{X: d.Rect.X + local.X, Y: d.Rect.Y + local.Y}
-		}
-		active, _, _ = h.layout.At(h.pointer)
+		active = h.host
 	}
 	h.active = active.ID
 
-	// When the pointer reaches the edge of the screen of the device that
-	// holds it, and there is a screen next to it, the cursor of that
-	// device is warped to the other edge, and the pointer goes on.
-	warp := h.warpLocked(id, localX, localY)
+	// The cursor of the system cannot leave the screen it is on, so when
+	// it reaches the edge of the screen of the device that holds the
+	// pointer, it is warped to the other edge of that screen, and the
+	// pointer goes on.
+	warp := h.warpLocked(id, localX, localY, dx, dy, takeover)
 	if warp != nil {
 		// The cursor of the device that holds the pointer goes to the
 		// place of the warp. The device says nothing about it, because
 		// the move is made by the system and not by the user, so the
 		// place is remembered here.
+		h.ctrlX, h.ctrlY = warp.X, warp.Y
 		if id == h.id {
-			h.cursorX, h.cursorY = warp.X, warp.Y
+			h.hostX, h.hostY = warp.X, warp.Y
 		} else if p, ok := h.peers[id]; ok {
 			p.x, p.y = warp.X, warp.Y
 		}
 	}
 
+	// The device that holds the pointer is told where the cursor has to
+	// go, and every device is told where the pointer is.
 	controller := h.controller
+	activeID := h.active
+	pointer := h.pointer
 	peers := make([]*peer, 0, len(h.peers))
 	for _, pid := range h.order {
 		peers = append(peers, h.peers[pid])
 	}
+
+	// Only the screen that holds the pointer shows a cursor, so the
+	// device is told whether its own cursor is of any use.
+	local := h.localPointLocked()
+	visible := h.localVisibleLocked()
+	tell := h.localActive != nil && (!h.told || h.toldActive != h.active ||
+		h.toldVisible != visible || h.toldLocal != local)
+	if tell {
+		h.told = true
+		h.toldActive, h.toldVisible, h.toldLocal = h.active, visible, local
+	}
+	notify := h.localActive
+
+	// The cursor of the host is put where the pointer is, when the
+	// pointer is on the screen of the host.
+	if visible && controller != h.id {
+		h.hostX, h.hostY = local.X, local.Y
+	}
+
 	h.mu.Unlock()
 
-	// The device that holds the pointer is told to move its cursor.
+	// The cursor of the device that holds the pointer goes to the place
+	// of the warp.
 	if warp != nil {
 		if id == h.id {
 			h.warpLocal(warp.X, warp.Y)
@@ -437,17 +511,17 @@ func (h *Hub) pointerMoved(id string, localX, localY int, kind protocol.EventKin
 		_ = p.write(protocol.Message{
 			Type:   protocol.TypePointer,
 			Device: controller,
-			Active: active.ID,
-			X:      h.pointer.X,
-			Y:      h.pointer.Y,
+			Active: activeID,
+			X:      pointer.X,
+			Y:      pointer.Y,
 		})
 	}
 
 	// A button or a wheel belongs to the screen the pointer is on.
 	if kind == protocol.EventButton || kind == protocol.EventWheel {
-		if active.ID != controller {
+		if activeID != controller {
 			for _, p := range peers {
-				if p.id == active.ID {
+				if p.id == activeID {
 					_ = p.write(protocol.Message{
 						Type:   protocol.TypeEvent,
 						Kind:   kind,
@@ -460,72 +534,107 @@ func (h *Hub) pointerMoved(id string, localX, localY int, kind protocol.EventKin
 			}
 		}
 	}
+
+	// The device is told about the pointer after the lock of the hub is
+	// gone, because the callback asks for the lock of the session, and
+	// the session asks for the lock of the hub.
+	if tell && notify != nil {
+		notify(activeID, local.X, local.Y, visible)
+	}
+}
+
+// takeOverLocked gives the pointer to a device and puts it on the place of
+// the cursor of that device. The lock of the hub must be held.
+func (h *Hub) takeOverLocked(id string, localX, localY int) {
+	h.controller = id
+	h.accum = virtual.Point{}
+	h.anchorValid = true
+	if d, ok := h.layout.Device(id); ok {
+		h.anchor = virtual.Point{X: d.Rect.X + localX, Y: d.Rect.Y + localY}
+	} else {
+		h.anchor = virtual.Point{X: localX, Y: localY}
+	}
+	h.pointer = h.anchor
+	h.ctrlX, h.ctrlY = localX, localY
 }
 
 // warpLocked tells where the cursor of the device that holds the pointer
-// has to go, when the pointer walks to the edge of its screen.
+// has to go, when it reaches the edge of its screen.
 //
 // The lock of the hub must be held.
-func (h *Hub) warpLocked(id string, localX, localY int) *virtual.Point {
+func (h *Hub) warpLocked(id string, localX, localY, dx, dy int, takeover bool) *virtual.Point {
 	d, ok := h.layout.Device(id)
 	if !ok || d.Width <= 0 || d.Height <= 0 {
 		return nil
 	}
+	// The pointer can only go on when the virtual desktop has room left
+	// on that side.
+	b := h.layout.Bounds()
 	switch {
-	case localX >= d.Width-1 && h.layout.HasNeighbor(id, protocol.EdgeRight):
-		// The pointer goes on to the right, so the cursor goes back to
-		// the left of the screen. The place of the screen moves by the
-		// same amount, so the pointer goes on where it was.
-		h.originX += d.Width - 1
+	case (dx > 0 || takeover) && localX >= d.Width-1 && h.pointer.X < b.X+b.Width-1:
+		// The cursor goes back to the left of the screen, so that the
+		// mouse can go on to the right.
 		return &virtual.Point{X: 0, Y: localY}
-	case localX <= 0 && h.layout.HasNeighbor(id, protocol.EdgeLeft):
-		h.originX -= d.Width - 1
+	case dx < 0 && localX <= 0 && h.pointer.X > b.X:
 		return &virtual.Point{X: d.Width - 1, Y: localY}
-	case localY >= d.Height-1 && h.layout.HasNeighbor(id, protocol.EdgeBottom):
-		h.originY += d.Height - 1
+	case dy > 0 && localY >= d.Height-1 && h.pointer.Y < b.Y+b.Height-1:
 		return &virtual.Point{X: localX, Y: 0}
-	case localY <= 0 && h.layout.HasNeighbor(id, protocol.EdgeTop):
-		h.originY -= d.Height - 1
+	case dy < 0 && localY <= 0 && h.pointer.Y > b.Y:
 		return &virtual.Point{X: localX, Y: d.Height - 1}
 	}
 	return nil
 }
 
-// setOriginLocked puts the screen of a device back in its place, which is
-// what happens when the pointer moves to that device. The lock of the hub
-// must be held.
-func (h *Hub) setOriginLocked(id string) {
-	if d, ok := h.layout.Device(id); ok {
-		h.originX, h.originY = d.Rect.X, d.Rect.Y
-	} else {
-		h.originX, h.originY = 0, 0
+// localPointLocked returns where the pointer is on the screen of this
+// device. The lock of the hub must be held.
+func (h *Hub) localPointLocked() virtual.Point {
+	return virtual.Point{
+		X: h.pointer.X - h.host.Rect.X,
+		Y: h.pointer.Y - h.host.Rect.Y,
 	}
+}
+
+// localVisibleLocked tells whether the cursor of this device is of any
+// use: only the screen that holds the pointer shows a cursor.
+//
+// The lock of the hub must be held.
+func (h *Hub) localVisibleLocked() bool {
+	if h.active != h.id {
+		return false
+	}
+	if h.controller != h.id {
+		// The pointer is driven by another device, so the cursor of this
+		// device shows where the pointer is.
+		return true
+	}
+	// The cursor of the device that holds the pointer is the pointer
+	// itself, as long as it is where the pointer is. After a warp it is
+	// not, and the cursor is of no use until the pointer comes back.
+	local := h.localPointLocked()
+	return abs(local.X-h.hostX) <= 1 && abs(local.Y-h.hostY) <= 1
 }
 
 // warpLocal moves the cursor of the mouse of this device.
 func (h *Hub) warpLocal(x, y int) {
-	if h.localWarp != nil {
-		h.localWarp(x, y)
+	h.mu.Lock()
+	fn := h.localWarp
+	h.mu.Unlock()
+	if fn != nil {
+		fn(x, y)
 	}
 }
 
-// LocalMove moves the pointer of the virtual desktop to the place of the
-// cursor of the mouse of this device.
+// LocalMove moves the pointer of the virtual desktop with the movement of
+// the mouse of this device.
 //
 // Moving the mouse of the host takes the pointer back, the same way
 // moving the mouse of a client does.
-func (h *Hub) LocalMove(x, y int) {
+func (h *Hub) LocalMove(dx, dy, x, y int) {
 	h.mu.Lock()
-	if h.controller != h.id {
-		// The mouse of the host takes the pointer over.
-		h.controller = h.id
-		h.setOriginLocked(h.id)
-	}
-	h.cursorX = x
-	h.cursorY = y
+	h.hostX, h.hostY = x, y
 	h.mu.Unlock()
 
-	h.pointerMoved(h.id, x, y, protocol.EventMove, 0, false, 0)
+	h.pointerMoved(h.id, x, y, dx, dy, protocol.EventMove, 0, false, 0)
 }
 
 // LocalEvent takes a mouse event of the mouse of this device.
@@ -541,10 +650,10 @@ func (h *Hub) LocalEvent(kind protocol.EventKind, dx, dy int, btn protocol.Butto
 		h.mu.Unlock()
 		return
 	}
-	localX, localY := h.cursorX, h.cursorY
+	localX, localY := h.ctrlX, h.ctrlY
 	h.mu.Unlock()
 
-	h.pointerMoved(h.id, localX, localY, kind, btn, down, wheel)
+	h.pointerMoved(h.id, localX, localY, dx, dy, kind, btn, down, wheel)
 
 	// The buttons and the wheel of the host go to the screen the pointer
 	// is on.
@@ -709,4 +818,12 @@ func (p *peer) write(m protocol.Message) error {
 		_ = p.conn.Close()
 	}
 	return err
+}
+
+// abs returns the distance between two numbers.
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }

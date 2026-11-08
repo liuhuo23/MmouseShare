@@ -218,6 +218,29 @@ func (s *Session) StartHost(port int) error {
 		}
 	})
 
+	// Only the screen that holds the pointer shows a cursor. The other
+	// screens hide theirs, so that the pointer does not look like it
+	// moves on two screens at once.
+	h.SetLocalActive(func(active string, x, y int, visible bool) {
+		if backend == nil {
+			return
+		}
+		if !visible {
+			_ = backend.ShowCursor(false)
+			return
+		}
+		_ = backend.ShowCursor(true)
+		s.mu.Lock()
+		sx, sy := s.cursorX, s.cursorY
+		s.mu.Unlock()
+		// The cursor is only moved when it is not where the pointer is
+		// already: the cursor of the device that holds the pointer is
+		// the mouse of the user, and it must not be fought over.
+		if !near(sx, x) || !near(sy, y) {
+			_ = backend.MoveTo(x, y)
+		}
+	})
+
 	if err := h.Listen(); err != nil {
 		return err
 	}
@@ -332,6 +355,9 @@ func (s *Session) Stop() {
 	s.mu.Unlock()
 
 	if backend != nil {
+		// The cursor of this device may have been hidden while the
+		// pointer was on another screen, so it is shown again.
+		_ = backend.ShowCursor(true)
 		_ = backend.Stop()
 	}
 	if h != nil {
@@ -401,7 +427,7 @@ func (s *Session) onLocalEvent(e input.Event) {
 			// The cursor of this device is tracked on its own screen,
 			// and the pointer of the virtual desktop follows it.
 			x, y := s.trackCursor(e)
-			h.LocalMove(x, y)
+			h.LocalMove(e.DX, e.DY, x, y)
 		case input.KindButton:
 			h.LocalEvent(protocol.EventButton, 0, 0, protocol.Button(e.Button), e.Down, 0)
 		case input.KindWheel:
@@ -499,10 +525,27 @@ func (s *Session) onRemotePointer(device, active string, x, y int) {
 	// or at the edge of it when it falls outside.
 	if backend != nil && own != nil {
 		local := own.Local(virtual.Point{X: x, Y: y})
-		_ = backend.MoveTo(local.X, local.Y)
-		s.mu.Lock()
-		s.cursorX, s.cursorY = local.X, local.Y
-		s.mu.Unlock()
+		switch {
+		case active != s.id:
+			// The pointer is on another screen, so this one shows
+			// nothing at all.
+			_ = backend.ShowCursor(false)
+		case device == s.id:
+			// This device holds the pointer, so its own cursor is the
+			// pointer. It is only of use while it is where the pointer
+			// is.
+			s.mu.Lock()
+			sx, sy := s.cursorX, s.cursorY
+			s.mu.Unlock()
+			if near(sx, local.X) && near(sy, local.Y) {
+				_ = backend.ShowCursor(true)
+			} else {
+				_ = backend.ShowCursor(false)
+			}
+		default:
+			_ = backend.ShowCursor(true)
+			_ = backend.MoveTo(local.X, local.Y)
+		}
 	}
 	s.notify()
 }
@@ -581,6 +624,15 @@ func (s *Session) screenHeightLocked() int {
 		return 0
 	}
 	return screens[0].Height
+}
+
+// near tells whether two places are the same, or one pixel apart.
+func near(a, b int) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d <= 1
 }
 
 // Name returns the name of this device.

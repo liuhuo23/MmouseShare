@@ -136,6 +136,8 @@ var (
 	cgDisplayPixelsHigh         func(display uint32) int32
 	cgDisplayBounds             func(display uint32) cgRect
 	cgMainDisplayID             func() uint32
+	cgDisplayHideCursor         func(display uint32) bool
+	cgDisplayShowCursor         func(display uint32) bool
 
 	cfRelease                     func(uintptr)
 	cfRunLoopGetCurrent           func() uintptr
@@ -192,6 +194,8 @@ func bindCoreGraphics() error {
 	purego.RegisterLibFunc(&cgDisplayPixelsHigh, cg, "CGDisplayPixelsHigh")
 	purego.RegisterLibFunc(&cgDisplayBounds, cg, "CGDisplayBounds")
 	purego.RegisterLibFunc(&cgMainDisplayID, cg, "CGMainDisplayID")
+	purego.RegisterLibFunc(&cgDisplayHideCursor, cg, "CGDisplayHideCursor")
+	purego.RegisterLibFunc(&cgDisplayShowCursor, cg, "CGDisplayShowCursor")
 
 	purego.RegisterLibFunc(&cfRelease, cf, "CFRelease")
 	purego.RegisterLibFunc(&cfRunLoopGetCurrent, cf, "CFRunLoopGetCurrent")
@@ -735,6 +739,29 @@ func (b *darwinBackend) Primary() Screen {
 	}
 	s := screens[0]
 	return Screen{X: int(x), Y: int(y), Width: s.Width, Height: s.Height}
+}
+
+// ShowCursor shows the cursor of the computer or hides it.
+//
+// Only the screen that holds the pointer of the sharing shows a cursor, so
+// the cursor of the other screens is hidden while the pointer is elsewhere.
+// The window server keeps the cursor of every screen on its own, so the
+// cursor is taken away from all of them.
+func (b *darwinBackend) ShowCursor(show bool) error {
+	var displays [16]uint32
+	var count uint32
+	if cgGetActiveDisplayList(uint32(len(displays)), &displays[0], &count) != 0 || count == 0 {
+		return errors.New("input: no screen to show the cursor on")
+	}
+	for i := uint32(0); i < count; i++ {
+		display := displays[i]
+		if show {
+			cgDisplayShowCursor(display)
+		} else {
+			cgDisplayHideCursor(display)
+		}
+	}
+	return nil
 }
 
 // darwinTapOwner is the backend of the tap of the mouse. There is one tap

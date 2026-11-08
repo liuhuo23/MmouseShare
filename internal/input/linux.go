@@ -273,6 +273,30 @@ func (b *linuxBackend) Primary() Screen {
 	return Screen{X: int(rootX), Y: int(rootY), Width: b.x.width, Height: b.x.height}
 }
 
+// ShowCursor shows the cursor of the computer or hides it.
+//
+// Only the screen that holds the pointer of the sharing shows a cursor, so
+// the cursor of the other screens is hidden while the pointer is elsewhere.
+//
+// The cursor is hidden with the XFixes library, which is not on every
+// computer. Without it the cursor stays as it is, and the sharing works
+// all the same.
+func (b *linuxBackend) ShowCursor(show bool) error {
+	b.xmu.Lock()
+	defer b.xmu.Unlock()
+	if b.x.hideCursor == nil || b.x.showCursor == nil {
+		return nil
+	}
+	window := b.x.defaultRoot(b.x.display)
+	if show {
+		b.x.showCursor(b.x.display, window)
+	} else {
+		b.x.hideCursor(b.x.display, window)
+	}
+	b.x.flush(b.x.display)
+	return nil
+}
+
 // xButton returns the number of a button of the mouse in the X11.
 func xButton(button Button) (uintptr, bool) {
 	switch button {
@@ -743,6 +767,11 @@ type xlib struct {
 	fakeRelative  func(uintptr, int, int, uintptr) int
 	fakeButton    func(uintptr, uintptr, int, uintptr) int
 	queryPointer  func(uintptr, uintptr, *uintptr, *uintptr, *int32, *int32, *int32, *int32, *uint32) int32
+	// hideCursor and showCursor are the functions of the XFixes library,
+	// which are not everywhere. Without them the cursor of the computer
+	// cannot be hidden, and the sharing works all the same.
+	hideCursor func(display uintptr, window uintptr)
+	showCursor func(display uintptr, window uintptr)
 }
 
 // openXlib loads the X11 and the XTest library and opens the display of the
@@ -794,6 +823,20 @@ func openXlib() (*xlib, error) {
 	}
 	if err := bind(libs, "XQueryPointer", &x.queryPointer); err != nil {
 		return nil, err
+	}
+
+	// The library of the XFixes is not on every computer, and it is only
+	// needed to hide the cursor of the screen that does not hold the
+	// pointer, so a computer without it still shares its mouse.
+	if fixes, err := purego.Dlopen("libXfixes.so.3", purego.RTLD_LAZY|purego.RTLD_GLOBAL); err == nil {
+		hide, hideErr := purego.Dlsym(fixes, "XFixesHideCursor")
+		show, showErr := purego.Dlsym(fixes, "XFixesShowCursor")
+		if hideErr == nil && hide != 0 {
+			purego.RegisterFunc(&x.hideCursor, hide)
+		}
+		if showErr == nil && show != 0 {
+			purego.RegisterFunc(&x.showCursor, show)
+		}
 	}
 
 	// A nil name makes the X11 use the DISPLAY of the environment.

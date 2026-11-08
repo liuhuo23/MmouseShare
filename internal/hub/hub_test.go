@@ -37,6 +37,10 @@ func connect(t *testing.T, h *Hub, name string, edge protocol.Edge, width, heigh
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
+	// A message that does not come must not hold the test for good.
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 	if err := protocol.Write(rw, protocol.Message{
@@ -134,7 +138,7 @@ func TestThePointerCrossesToTheDeviceOnTheRight(t *testing.T) {
 	h.SetLocalWarp(func(x, y int) { warpX, warpY = x, y })
 
 	// The pointer walks to the right edge of the host.
-	h.LocalMove(1919, 100)
+	h.LocalMove(0, 0, 1919, 100)
 
 	msg := waitFor(t, r, protocol.TypePointer)
 	if msg.Active != "host" {
@@ -147,7 +151,7 @@ func TestThePointerCrossesToTheDeviceOnTheRight(t *testing.T) {
 	}
 
 	// The pointer goes on to the screen of the client.
-	h.LocalMove(1, 100)
+	h.LocalMove(1, 0, 1, 100)
 
 	msg = waitFor(t, r, protocol.TypePointer)
 	if msg.Active != "client" {
@@ -177,9 +181,9 @@ func TestTheButtonGoesToTheScreenThePointerIsOn(t *testing.T) {
 	waitFor(t, r, protocol.TypeDevices)
 
 	// The pointer walks onto the screen of the client.
-	h.LocalMove(1919, 100)
+	h.LocalMove(0, 0, 1919, 100)
 	waitFor(t, r, protocol.TypePointer)
-	h.LocalMove(1, 100)
+	h.LocalMove(1, 0, 1, 100)
 	waitFor(t, r, protocol.TypePointer)
 
 	// The click that follows belongs to the client.
@@ -251,7 +255,7 @@ func TestThePointerStaysOnTheVirtualDesktop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h.LocalMove(-5, 100)
+	h.LocalMove(0, 0, -5, 100)
 
 	p := h.Pointer()
 	if p.X < 0 {
@@ -304,6 +308,131 @@ func TestTheButtonOfTheClientKeepsThePlaceOfThePointer(t *testing.T) {
 	if p.X != 1920+105 || p.Y != 207 {
 		t.Errorf("the pointer is at %d,%d, want %d,%d",
 			p.X, p.Y, 1920+105, 207)
+	}
+}
+
+// TestThePointerGoesOnAndDoesNotComeBack makes sure that a pointer that
+// walks onto the screen of another device keeps going there, instead of
+// coming back to the screen of the host.
+func TestThePointerGoesOnAndDoesNotComeBack(t *testing.T) {
+	h, err := New("Host", "host", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	h.SetHostScreen(1920, 1080)
+	if err := h.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	connect(t, h, "client", protocol.EdgeRight, 1280, 1024)
+
+	// The pointer walks to the right edge of the host.
+	h.LocalMove(0, 0, 1919, 100)
+	// The mouse goes on to the right, one pixel at a time. The cursor of
+	// the host cannot leave its screen, so it is warped again and again.
+	for i := 1; i <= 2000; i++ {
+		h.LocalMove(1, 0, i%1920, 100)
+	}
+
+	p := h.Pointer()
+	if p.X != 1920+1280-1 {
+		t.Errorf("the pointer is at %d, want it at the edge of the desktop", p.X)
+	}
+	if h.Active() != "client" {
+		t.Errorf("the pointer is on %s, want client", h.Active())
+	}
+}
+
+// TestThePointerComesBackWithTheMouse makes sure that the pointer comes
+// back to the screen of the host when the mouse goes back.
+func TestThePointerComesBackWithTheMouse(t *testing.T) {
+	h, err := New("Host", "host", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	h.SetHostScreen(1920, 1080)
+	if err := h.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	connect(t, h, "client", protocol.EdgeRight, 1280, 1024)
+
+	// The pointer walks onto the screen of the client.
+	h.LocalMove(0, 0, 1919, 100)
+	h.LocalMove(1, 0, 1, 100)
+	if h.Active() != "client" {
+		t.Fatalf("the pointer is on %s, want client", h.Active())
+	}
+
+	// The mouse goes back to the left.
+	for i := 0; i < 2000; i++ {
+		h.LocalMove(-1, 0, 0, 100)
+	}
+
+	p := h.Pointer()
+	if p.X != 0 {
+		t.Errorf("the pointer is at %d, want it at the left of the desktop", p.X)
+	}
+	if h.Active() != "host" {
+		t.Errorf("the pointer is on %s, want host", h.Active())
+	}
+}
+
+// TestTheDeviceIsToldWhereThePointerIs makes sure that the device is told
+// when the pointer walks to another screen, and that it is told that its
+// own cursor is of no use then.
+func TestTheDeviceIsToldWhereThePointerIs(t *testing.T) {
+	h, err := New("Host", "host", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	h.SetHostScreen(1920, 1080)
+	if err := h.Listen(); err != nil {
+		t.Fatal(err)
+	}
+
+	connect(t, h, "client", protocol.EdgeRight, 1280, 1024)
+
+	var active string
+	var x, y int
+	var visible bool
+	h.SetLocalActive(func(a string, px, py int, v bool) {
+		active, x, y, visible = a, px, py, v
+	})
+
+	// The pointer is on the screen of the host, so its cursor is of use.
+	h.LocalMove(0, 0, 100, 100)
+	if active != "host" {
+		t.Errorf("the pointer is on %s, want host", active)
+	}
+	if !visible {
+		t.Error("the cursor of the host is of no use, want it to be of use")
+	}
+	if x != 100 || y != 100 {
+		t.Errorf("the pointer is at %d,%d, want 100,100", x, y)
+	}
+
+	// The pointer walks onto the screen of the client, so the cursor of
+	// the host is of no use.
+	h.LocalMove(1819, 0, 1919, 100)
+	h.LocalMove(1, 0, 1, 100)
+	if active != "client" {
+		t.Errorf("the pointer is on %s, want client", active)
+	}
+	if visible {
+		t.Error("the cursor of the host is of use, want it to be of no use")
+	}
+
+	// The pointer comes back, and the cursor of the host is of use again.
+	h.LocalMove(-1, 0, 0, 100)
+	if active != "host" {
+		t.Errorf("the pointer is on %s, want host", active)
+	}
+	if !visible {
+		t.Error("the cursor of the host is of no use, want it to be of use")
 	}
 }
 
