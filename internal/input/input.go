@@ -57,6 +57,11 @@ type Event struct {
 // ErrUnsupported means the platform has no capture or injection.
 var ErrUnsupported = errors.New("input: not supported on this platform")
 
+// ErrAccessibility means that the system waits for the person to allow the
+// program to read and to post the input of the computer. macOS keeps that
+// permission in the accessibility part of its settings.
+var ErrAccessibility = errors.New("input: MmouseShare needs the permission of the accessibility on macOS, it is in the settings of the system")
+
 // Screen is a screen of the computer.
 type Screen struct {
 	// X and Y are the position of the screen on the desktop.

@@ -37,20 +37,20 @@ const (
 
 	// The tap is turned off when it takes too long or when the user asks
 	// for it.
-	cgEventTapDisabledByTimeout  = 0xFFFFFFFE
+	cgEventTapDisabledByTimeout   = 0xFFFFFFFE
 	cgEventTapDisabledByUserInput = 0xFFFFFFFF
 )
 
 // The fields of an event.
 const (
-	cgFieldMouseButtonNumber      = 3
-	cgFieldMouseDeltaX            = 4
-	cgFieldMouseDeltaY            = 5
-	cgFieldScrollDeltaAxis1       = 11
-	cgFieldSourceUserData         = 42
-	cgFieldScrollIsContinuous     = 88
+	cgFieldMouseButtonNumber       = 3
+	cgFieldMouseDeltaX             = 4
+	cgFieldMouseDeltaY             = 5
+	cgFieldScrollDeltaAxis1        = 11
+	cgFieldSourceUserData          = 42
+	cgFieldScrollIsContinuous      = 88
 	cgFieldScrollFixedPtDeltaAxis1 = 93
-	cgFieldScrollPointDeltaAxis1  = 96
+	cgFieldScrollPointDeltaAxis1   = 96
 
 	// cgFieldDirectionInvertedFromDevice tells that the system turned the
 	// direction of the device the other way round, which it does when the
@@ -130,6 +130,7 @@ var (
 	cgEventTapCreate            func(tap, place, options uint32, mask uintptr, callback uintptr, userInfo uintptr) uintptr
 	cgEventTapEnable            func(port uintptr, enable bool)
 	cgPreflightPostEventAccess  func() bool
+	cgRequestPostEventAccess    func() bool
 	cgGetActiveDisplayList      func(max uint32, displays *uint32, count *uint32) int32
 	cgDisplayPixelsWide         func(display uint32) int32
 	cgDisplayPixelsHigh         func(display uint32) int32
@@ -185,6 +186,7 @@ func bindCoreGraphics() error {
 	purego.RegisterLibFunc(&cgEventTapCreate, cg, "CGEventTapCreate")
 	purego.RegisterLibFunc(&cgEventTapEnable, cg, "CGEventTapEnable")
 	purego.RegisterLibFunc(&cgPreflightPostEventAccess, cg, "CGPreflightPostEventAccess")
+	purego.RegisterLibFunc(&cgRequestPostEventAccess, cg, "CGRequestPostEventAccess")
 	purego.RegisterLibFunc(&cgGetActiveDisplayList, cg, "CGGetActiveDisplayList")
 	purego.RegisterLibFunc(&cgDisplayPixelsWide, cg, "CGDisplayPixelsWide")
 	purego.RegisterLibFunc(&cgDisplayPixelsHigh, cg, "CGDisplayPixelsHigh")
@@ -253,7 +255,16 @@ func newDarwinBackend() (Backend, error) {
 		return nil, err
 	}
 	if !cgPreflightPostEventAccess() {
-		return nil, errors.New("input: MmouseShare needs the permission of the accessibility on macOS, it is in the settings of the system")
+		// The settings give the permission, but the person has to put the
+		// program in the list there. Asking the system for the access
+		// shows its prompt, which does that; the grant itself is not
+		// something the program can make.
+		if cgRequestPostEventAccess != nil {
+			cgRequestPostEventAccess()
+		}
+		if !cgPreflightPostEventAccess() {
+			return nil, ErrAccessibility
+		}
 	}
 
 	b := &darwinBackend{}
@@ -347,7 +358,7 @@ func (b *darwinBackend) run(ready chan<- error) {
 
 	port := cgEventTapCreate(cgHIDEventTap, cgHeadInsertEventTap, cgEventTapOptionListenOnly, cgEventMask, darwinTapCallbackPtr, 0)
 	if port == 0 {
-		ready <- errors.New("input: the event tap could not be made, MmouseShare needs the permission of the accessibility on macOS")
+		ready <- fmt.Errorf("%w: the event tap could not be made", ErrAccessibility)
 		return
 	}
 	source := cfMachPortCreateRunLoopSource(0, port, 0)
@@ -755,7 +766,8 @@ func currentDarwinBackend() *darwinBackend {
 
 // darwinTapCallback is the callback the window server calls for every event
 // of the mouse.
-func darwinTapCallback(proxy uintptr, typ uintptr, event uintptr, userInfo uintptr) uintptr {	t := uint32(typ)
+func darwinTapCallback(proxy uintptr, typ uintptr, event uintptr, userInfo uintptr) uintptr {
+	t := uint32(typ)
 	if t == cgEventTapDisabledByTimeout || t == cgEventTapDisabledByUserInput {
 		// The tap was turned off, so it is turned on again.
 		b := currentDarwinBackend()

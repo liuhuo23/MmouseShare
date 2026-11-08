@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -23,12 +24,17 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"mmouseshare/internal/discovery"
+	"mmouseshare/internal/input"
 	"mmouseshare/internal/protocol"
 	"mmouseshare/internal/session"
 )
 
 // defaultHostPort is the port the host listens on.
 const defaultHostPort = 27301
+
+// accessibilitySettingsURL is the part of the settings of macOS where the
+// person allows the program to read and to post the input of the computer.
+const accessibilitySettingsURL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
 // The role of the device.
 const (
@@ -55,6 +61,9 @@ type app struct {
 	running bool
 	// status is the last thing that happened.
 	status string
+	// waitsAccessibility tells that the last failure was the permission of
+	// the accessibility, which the window offers to open the settings for.
+	waitsAccessibility bool
 	// address is the address of the host a client joins.
 	address string
 	// edge is where the device sits in the virtual desktop.
@@ -161,6 +170,13 @@ func (a *app) view(c *ui.Context) {
 
 		if a.status != "" {
 			ui.Text(c, a.status).FontSize(12).TextColor(t.TextMuted)
+		}
+		if a.waitsAccessibility {
+			ui.Text(c, "在「系统设置 → 隐私与安全性 → 辅助功能」里勾选 MmouseShare，然后回到这里再点一次。").
+				FontSize(12).TextColor(t.TextMuted)
+			if ui.Button(c, "打开辅助功能设置").Width(160).Clicked() {
+				c.OpenURL(accessibilitySettingsURL)
+			}
 		}
 	})
 }
@@ -300,17 +316,30 @@ func (a *app) setEdge(edge string) {
 	}
 }
 
+// fail puts the error of the starting of the sharing in the window. The one
+// of the permission of the accessibility is the only case the person can fix
+// in the settings, so it says where to go and the window offers to open it.
+func (a *app) fail(prefix string, err error) {
+	a.waitsAccessibility = errors.Is(err, input.ErrAccessibility)
+	if a.waitsAccessibility {
+		a.status = prefix + "macOS 还没允许 MmouseShare 使用「辅助功能」。"
+		return
+	}
+	a.status = prefix + err.Error()
+}
+
 // startHost starts the sharing of the mouse of this device.
 func (a *app) startHost() {
 	if a.session == nil {
 		return
 	}
 	if err := a.session.StartHost(defaultHostPort); err != nil {
-		a.status = "启动失败：" + err.Error()
+		a.fail("启动失败：", err)
 		a.refresh()
 		return
 	}
 	a.running = true
+	a.waitsAccessibility = false
 	a.status = "正在共享鼠标，其他设备可以连接了。"
 	go a.session.KeepAlive(a.stop)
 	a.refresh()
@@ -342,11 +371,12 @@ func (a *app) startClient() {
 		addr = fmt.Sprintf("%s:%d", addr, defaultHostPort)
 	}
 	if err := a.session.StartClient(addr); err != nil {
-		a.status = "连接失败：" + err.Error()
+		a.fail("连接失败：", err)
 		a.refresh()
 		return
 	}
 	a.running = true
+	a.waitsAccessibility = false
 	a.status = "已连接到 " + addr
 	go a.session.KeepAlive(a.stop)
 	a.refresh()
