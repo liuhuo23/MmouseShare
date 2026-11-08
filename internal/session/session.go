@@ -133,8 +133,12 @@ func (s *Session) SetEdge(edge protocol.Edge) error {
 	s.mu.Lock()
 	s.edge = edge
 	c := s.client
-	width := s.screenWidth()
-	height := s.screenHeight()
+	// The width and the height of the screen come from the locked half of
+	// the pair: the lock of the session is held here already, and taking
+	// it again would stop this goroutine, and the window that called it,
+	// for good.
+	width := s.screenWidthLocked()
+	height := s.screenHeightLocked()
 	s.mu.Unlock()
 
 	if c != nil {
