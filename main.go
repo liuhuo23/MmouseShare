@@ -172,7 +172,9 @@ func (a *app) view(c *ui.Context) {
 			ui.Text(c, a.status).FontSize(12).TextColor(t.TextMuted)
 		}
 		if a.waitsAccessibility {
-			ui.Text(c, "在「系统设置 → 隐私与安全性 → 辅助功能」里勾选 MmouseShare，然后回到这里再点一次。").
+			ui.Text(c, "在「系统设置 → 隐私与安全性 → 辅助功能」里勾选 MmouseShare，然后退出并重新打开本程序，再点一次。").
+				FontSize(12).TextColor(t.TextMuted)
+			ui.Text(c, "系统只在程序启动时读取这项授权，勾选后不重新打开仍会提示失败。").
 				FontSize(12).TextColor(t.TextMuted)
 			if ui.Button(c, "打开辅助功能设置").Width(160).Clicked() {
 				c.OpenURL(accessibilitySettingsURL)
